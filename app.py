@@ -29,7 +29,7 @@ ENGLISH_STOPWORDS = {
     "about", "over", "after", "before", "through", "you", "he", "she", "they", "we",
     "i", "his", "her", "their", "our", "my", "your", "me", "them", "who", "what",
     "when", "where", "why", "how", "can", "could", "should", "would", "will", "shall",
-    "do", "does", "did", "have", "has", "had", "not", "no", "yes", "than", "also"
+    "do", "does", "did", "have", "has", "had", "not", "no", "yes", "also"
 }
 
 
@@ -64,7 +64,7 @@ def clean_text(text: str) -> str:
 def split_sentences(text: str, lang: str):
     text = clean_text(text)
     if lang == "ar":
-        sentences = re.split(r'(?<=[\.!\؟!])\s+', text)
+        sentences = re.split(r'(?<=[\.\!\؟])\s+', text)
     else:
         sentences = re.split(r'(?<=[.!?])\s+', text)
     return [s.strip() for s in sentences if s.strip()]
@@ -92,8 +92,7 @@ def extract_keywords(text: str, lang: str, top_n: int = 8):
         return []
 
     freq = Counter(words)
-    keywords = [word for word, _ in freq.most_common(top_n)]
-    return keywords
+    return [word for word, _ in freq.most_common(top_n)]
 
 
 def local_summarize(text: str, lang: str, num_sentences: int = 5):
@@ -109,6 +108,7 @@ def local_summarize(text: str, lang: str, num_sentences: int = 5):
     word_freq = Counter(words)
 
     sentence_scores = {}
+
     for sentence in sentences:
         if lang == "ar":
             sentence_words = re.findall(r'[\u0600-\u06FF]+', sentence)
@@ -139,23 +139,24 @@ def ai_summarize_with_openai(text: str, lang: str, num_sentences: int = 5):
     api_key = st.secrets.get("OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY", None)
 
     if not api_key or OpenAI is None:
-        return None
+        return None, "OpenAI API key is missing."
 
-    client = OpenAI(api_key=api_key)
+    try:
+        client = OpenAI(api_key=api_key)
 
-    if lang == "ar":
-        system_prompt = "أنت مساعد احترافي يلخص المستندات العربية بوضوح ودقة."
-        user_prompt = f"""
-لخص النص التالي في حوالي {num_sentences} نقاط أو جمل قصيرة وواضحة.
+        if lang == "ar":
+            system_prompt = "أنت مساعد احترافي يلخص المستندات العربية بوضوح ودقة."
+            user_prompt = f"""
+لخص النص التالي في حوالي {num_sentences} جمل أو نقاط قصيرة وواضحة.
 ركز على الأفكار الأساسية فقط.
 إذا كان النص قصيرًا جدًا، أعد أهم محتواه باختصار.
 
 النص:
 {text[:12000]}
 """
-    else:
-        system_prompt = "You are a professional assistant that summarizes English documents clearly and accurately."
-        user_prompt = f"""
+        else:
+            system_prompt = "You are a professional assistant that summarizes English documents clearly and accurately."
+            user_prompt = f"""
 Summarize the following text in about {num_sentences} clear bullet points or short sentences.
 Focus on the main ideas only.
 If the text is very short, return its key content briefly.
@@ -164,16 +165,19 @@ Text:
 {text[:12000]}
 """
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-    )
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+        )
 
-    return response.choices[0].message.content.strip()
+        return response.choices[0].message.content.strip(), None
+
+    except Exception as e:
+        return None, str(e)
 
 
 def render_keywords(keywords):
@@ -269,11 +273,11 @@ with st.sidebar:
         "Summarization mode",
         ["Smart Local", "OpenAI"],
         index=0,
-        help="OpenAI يحتاج API Key. إذا لم يوجد المفتاح، سيتم الرجوع للتلخيص المحلي.",
+        help="OpenAI يحتاج API Key ورصيد. إذا فشل، سيتم الرجوع تلقائيًا للتلخيص المحلي.",
     )
     num_sentences = st.slider("Number of summary sentences", min_value=3, max_value=12, value=5)
     show_text = st.checkbox("Show extracted text", value=False)
-    st.caption("Smart Local مجاني. OpenAI يعطي نتائج أفضل عند توفر المفتاح.")
+    st.caption("Smart Local مجاني. OpenAI يعطي نتائج أفضل عند توفر المفتاح والرصيد.")
 
 uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
 
@@ -294,17 +298,23 @@ if uploaded_file is not None:
                 model_used = "Local"
 
                 if summarization_mode == "OpenAI":
-                    summary = ai_summarize_with_openai(text, lang, num_sentences=num_sentences)
+                    summary, error_message = ai_summarize_with_openai(
+                        text, lang, num_sentences=num_sentences
+                    )
+
                     if summary:
                         model_used = "OpenAI"
                     else:
+                        st.warning("OpenAI is unavailable right now, so the app used Smart Local instead.")
+                        if error_message:
+                            st.caption(f"Reason: {error_message}")
                         summary = local_summarize(text, lang, num_sentences=num_sentences)
                         model_used = "Local fallback"
-
                 else:
                     summary = local_summarize(text, lang, num_sentences=num_sentences)
 
                 col1, col2, col3 = st.columns(3)
+
                 with col1:
                     st.markdown(f"""
                     <div class="metric-card">
@@ -312,6 +322,7 @@ if uploaded_file is not None:
                         <div class="metric-label">Pages</div>
                     </div>
                     """, unsafe_allow_html=True)
+
                 with col2:
                     st.markdown(f"""
                     <div class="metric-card">
@@ -319,10 +330,12 @@ if uploaded_file is not None:
                         <div class="metric-label">Characters</div>
                     </div>
                     """, unsafe_allow_html=True)
+
                 with col3:
+                    language_name = "Arabic" if lang == "ar" else "English"
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-number">{'Arabic' if lang == 'ar' else 'English'}</div>
+                        <div class="metric-number">{language_name}</div>
                         <div class="metric-label">{model_used}</div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -331,7 +344,11 @@ if uploaded_file is not None:
                 render_keywords(keywords)
 
                 st.subheader("Summary")
-                st.markdown(f'<div class="summary-box">{summary.replace(chr(10), "<br><br>")}</div>', unsafe_allow_html=True)
+                formatted_summary = summary.replace("\n", "<br><br>")
+                st.markdown(
+                    f'<div class="summary-box">{formatted_summary}</div>',
+                    unsafe_allow_html=True
+                )
 
                 st.download_button(
                     label="Download Summary",
@@ -344,6 +361,5 @@ if uploaded_file is not None:
                 if show_text:
                     with st.expander("Show extracted text"):
                         st.write(text[:8000])
-
 else:
     st.info("ابدأ برفع ملف PDF لتجربة التطبيق.")
