@@ -1,5 +1,9 @@
 import os
 import re
+import sqlite3
+import hashlib
+from uuid import uuid4
+from datetime import datetime
 from collections import Counter
 
 import streamlit as st
@@ -9,6 +13,9 @@ try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
+
+
+DB_PATH = "app_data.db"
 
 
 ARABIC_STOPWORDS = {
@@ -31,6 +38,122 @@ ENGLISH_STOPWORDS = {
     "when", "where", "why", "how", "can", "could", "should", "would", "will", "shall",
     "do", "does", "did", "have", "has", "had", "not", "no", "yes", "also"
 }
+
+
+def get_connection():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS analyses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            document_name TEXT NOT NULL,
+            language TEXT NOT NULL,
+            mode_used TEXT NOT NULL,
+            pages_count INTEGER NOT NULL,
+            characters_count INTEGER NOT NULL,
+            keywords TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            explanation TEXT NOT NULL,
+            key_points TEXT NOT NULL,
+            questions TEXT NOT NULL,
+            extracted_text TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def create_user(username: str, password: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            (username.strip(), hash_password(password), datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        return True, "Account created successfully."
+    except sqlite3.IntegrityError:
+        return False, "This username already exists."
+    finally:
+        conn.close()
+
+
+def authenticate_user(username: str, password: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM users WHERE username = ? AND password_hash = ?",
+        (username.strip(), hash_password(password))
+    )
+    user = cur.fetchone()
+    conn.close()
+    return user
+
+
+def save_analysis(user_id, document_name, language, mode_used, pages_count, characters_count,
+                  keywords, summary, explanation, key_points, questions, extracted_text):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO analyses (
+            user_id, document_name, language, mode_used, pages_count, characters_count,
+            keywords, summary, explanation, key_points, questions, extracted_text, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        document_name,
+        language,
+        mode_used,
+        pages_count,
+        characters_count,
+        keywords,
+        summary,
+        explanation,
+        key_points,
+        questions,
+        extracted_text,
+        datetime.utcnow().isoformat()
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_user_analyses(user_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM analyses
+        WHERE user_id = ?
+        ORDER BY id DESC
+    """, (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
 def detect_language(text: str) -> str:
@@ -161,35 +284,6 @@ def local_generate_questions(text: str, lang: str, num_questions: int = 5):
     return "\n".join(questions)
 
 
-def local_answer_question(text: str, question: str, lang: str):
-    sentences = split_sentences(text, lang)
-    if not sentences:
-        return "لا يوجد نص للإجابة منه." if lang == "ar" else "There is no text to answer from."
-
-    if lang == "ar":
-        q_words = set(re.findall(r'[\u0600-\u06FF]+', question))
-        scored = []
-        for sentence in sentences:
-            s_words = set(re.findall(r'[\u0600-\u06FF]+', sentence))
-            score = len(q_words.intersection(s_words))
-            scored.append((score, sentence))
-    else:
-        q_words = set(re.findall(r'[A-Za-z]+', question.lower()))
-        scored = []
-        for sentence in sentences:
-            s_words = set(re.findall(r'[A-Za-z]+', sentence.lower()))
-            score = len(q_words.intersection(s_words))
-            scored.append((score, sentence))
-
-    scored.sort(reverse=True, key=lambda x: x[0])
-    best_sentences = [sentence for score, sentence in scored[:3] if score > 0]
-
-    if best_sentences:
-        return "\n\n".join(best_sentences)
-
-    return "لم أجد إجابة واضحة في المستند." if lang == "ar" else "I could not find a clear answer in the document."
-
-
 def ai_text_task(prompt_system: str, prompt_user: str):
     api_key = st.secrets.get("OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY", None)
 
@@ -291,55 +385,32 @@ Text:
     return ai_text_task(system_prompt, user_prompt)
 
 
-def ai_answer_question(text: str, question: str, lang: str):
-    if lang == "ar":
-        system_prompt = "أنت مساعد يجيب على الأسئلة اعتمادًا على محتوى المستند فقط."
-        user_prompt = f"""أجب على السؤال التالي اعتمادًا على النص فقط.
-إذا لم تكن الإجابة موجودة بوضوح في النص، قل: لا أجد إجابة واضحة في المستند.
-
-السؤال:
-{question}
-
-النص:
-{text[:12000]}
-"""
-    else:
-        system_prompt = "You answer questions using only the document content."
-        user_prompt = f"""Answer the following question using only the text below.
-If the answer is not clearly in the text, say: I could not find a clear answer in the document.
-
-Question:
-{question}
-
-Text:
-{text[:12000]}
-"""
-    return ai_text_task(system_prompt, user_prompt)
-
-
 def render_keywords(keywords):
     if not keywords:
         return
-
     chips_html = ""
     for kw in keywords:
         chips_html += f'<span class="keyword-chip">{kw}</span> '
     st.markdown(chips_html, unsafe_allow_html=True)
 
 
-st.set_page_config(
-    page_title="AI Document Analyzer",
-    page_icon="📄",
-    layout="centered",
-)
+def reset_current_document():
+    for key in [
+        "current_text", "current_lang", "current_name", "current_summary",
+        "current_explanation", "current_questions", "current_key_points",
+        "current_keywords", "current_mode", "current_pages", "current_characters"
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+init_db()
+
+st.set_page_config(page_title="AI Document Assistant Pro", page_icon="📄", layout="wide")
 
 st.markdown("""
 <style>
-.block-container {
-    padding-top: 2rem;
-    padding-bottom: 2rem;
-    max-width: 920px;
-}
+.block-container {padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1200px;}
 .hero-box {
     padding: 1.3rem 1.4rem;
     border-radius: 18px;
@@ -347,215 +418,374 @@ st.markdown("""
     border: 1px solid rgba(255,255,255,0.08);
     margin-bottom: 1rem;
 }
-.hero-title {
-    font-size: 2.3rem;
-    font-weight: 800;
-    margin-bottom: 0.35rem;
-}
-.hero-subtitle {
-    color: #cbd5e1;
-    font-size: 1rem;
-}
+.hero-title {font-size: 2.1rem; font-weight: 800; margin-bottom: 0.35rem;}
+.hero-subtitle {color: #cbd5e1; font-size: 1rem;}
 .metric-card {
-    padding: 0.9rem 1rem;
-    border-radius: 16px;
-    background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(255,255,255,0.08);
-    text-align: center;
+    padding: 0.9rem 1rem; border-radius: 16px; background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08); text-align: center;
 }
-.metric-number {
-    font-size: 1.4rem;
-    font-weight: 700;
-}
-.metric-label {
-    color: #cbd5e1;
-    font-size: 0.9rem;
-}
+.metric-number {font-size: 1.4rem; font-weight: 700;}
+.metric-label {color: #cbd5e1; font-size: 0.9rem;}
 .keyword-chip {
-    display: inline-block;
-    padding: 0.35rem 0.7rem;
-    margin: 0.2rem 0.25rem 0.2rem 0;
-    border-radius: 999px;
-    background: #1d4ed8;
-    color: white;
-    font-size: 0.88rem;
-    font-weight: 600;
+    display: inline-block; padding: 0.35rem 0.7rem; margin: 0.2rem 0.25rem 0.2rem 0;
+    border-radius: 999px; background: #1d4ed8; color: white; font-size: 0.88rem; font-weight: 600;
 }
 .output-box {
-    padding: 1rem 1rem;
-    border-radius: 16px;
-    background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(255,255,255,0.08);
-    margin-bottom: 1rem;
+    padding: 1rem 1rem; border-radius: 16px; background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08); margin-bottom: 1rem;
+}
+.history-box {
+    padding: 0.8rem 0.9rem; border-radius: 14px; background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08); margin-bottom: 0.7rem;
 }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("""
-<div class="hero-box">
-    <div class="hero-title">AI Document Analyzer</div>
-    <div class="hero-subtitle">
-        ارفع ملف PDF لتحصل على ملخص، كلمات مفتاحية، شرح مبسط، أسئلة، أهم النقاط، ودردشة مع المستند.
+if "user" not in st.session_state:
+    st.session_state["user"] = None
+
+if st.session_state["user"] is None:
+    st.markdown("""
+    <div class="hero-box">
+        <div class="hero-title">AI Document Assistant Pro</div>
+        <div class="hero-subtitle">
+            نسخة متقدمة مع حسابات مستخدمين، حفظ التحليلات، قاعدة بيانات، ورفع عدة ملفات.
+        </div>
     </div>
-</div>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
-with st.sidebar:
-    st.header("Settings")
-    mode = st.radio(
-        "Analysis mode",
-        ["Smart Local", "OpenAI"],
-        index=0,
-        help="OpenAI يحتاج API key ورصيد. عند الفشل سيتم الرجوع للحلول المحلية.",
-    )
-    num_sentences = st.slider("Summary sentences", min_value=3, max_value=12, value=5)
-    num_questions = st.slider("Number of questions", min_value=3, max_value=10, value=5)
-    num_points = st.slider("Number of key points", min_value=3, max_value=10, value=5)
-    show_text = st.checkbox("Show extracted text", value=False)
+    tab1, tab2 = st.tabs(["Login", "Create Account"])
 
-uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+    with tab1:
+        st.subheader("Login")
+        login_username = st.text_input("Username", key="login_username")
+        login_password = st.text_input("Password", type="password", key="login_password")
 
-if uploaded_file is not None:
-    st.success(f"Uploaded file: {uploaded_file.name}")
-
-    if st.button("Analyze Document", use_container_width=True):
-        with st.spinner("Reading and analyzing the PDF..."):
-            text, num_pages = extract_text_from_pdf(uploaded_file)
-
-            if not text.strip():
-                st.error("No readable text was found in the PDF.")
+        if st.button("Login", use_container_width=True):
+            user = authenticate_user(login_username, login_password)
+            if user:
+                st.session_state["user"] = dict(user)
+                st.success("Logged in successfully.")
+                st.rerun()
             else:
-                lang = detect_language(text)
-                keywords = extract_keywords(text, lang, top_n=8)
+                st.error("Invalid username or password.")
 
-                st.session_state["doc_text"] = text
-                st.session_state["doc_lang"] = lang
-                st.session_state["doc_name"] = uploaded_file.name
+    with tab2:
+        st.subheader("Create Account")
+        signup_username = st.text_input("Choose a username", key="signup_username")
+        signup_password = st.text_input("Choose a password", type="password", key="signup_password")
+        signup_password2 = st.text_input("Confirm password", type="password", key="signup_password2")
 
-                model_used = "Local"
-
-                if mode == "OpenAI":
-                    summary, _ = ai_summarize_with_openai(text, lang, num_sentences)
-                    explanation, _ = ai_explain_document(text, lang)
-                    questions, _ = ai_generate_questions(text, lang, num_questions)
-                    key_points, _ = ai_key_points(text, lang, num_points)
-
-                    if summary and explanation and questions and key_points:
-                        model_used = "OpenAI"
-                    else:
-                        st.warning("OpenAI is unavailable right now, so Smart Local was used instead.")
-                        summary = local_summarize(text, lang, num_sentences)
-                        explanation = local_explain_document(text, lang)
-                        questions = local_generate_questions(text, lang, num_questions)
-                        key_points = local_key_points(text, lang, num_points)
-                        model_used = "Local fallback"
+        if st.button("Create Account", use_container_width=True):
+            if not signup_username.strip() or not signup_password.strip():
+                st.error("Please fill all fields.")
+            elif len(signup_password) < 6:
+                st.error("Password must be at least 6 characters.")
+            elif signup_password != signup_password2:
+                st.error("Passwords do not match.")
+            else:
+                ok, msg = create_user(signup_username, signup_password)
+                if ok:
+                    st.success(msg)
                 else:
-                    summary = local_summarize(text, lang, num_sentences)
-                    explanation = local_explain_document(text, lang)
-                    questions = local_generate_questions(text, lang, num_questions)
-                    key_points = local_key_points(text, lang, num_points)
+                    st.error(msg)
 
-                st.session_state["analysis_mode"] = mode
+else:
+    user = st.session_state["user"]
 
+    st.markdown(f"""
+    <div class="hero-box">
+        <div class="hero-title">AI Document Assistant Pro</div>
+        <div class="hero-subtitle">
+            Welcome, {user["username"]}. حلّل ملفات PDF، احفظ النتائج، وارجع لها لاحقًا.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with st.sidebar:
+        st.header("Settings")
+        mode = st.radio("Analysis mode", ["Smart Local", "OpenAI"], index=0)
+        num_sentences = st.slider("Summary sentences", min_value=3, max_value=12, value=5)
+        num_questions = st.slider("Questions", min_value=3, max_value=10, value=5)
+        num_points = st.slider("Key points", min_value=3, max_value=10, value=5)
+        show_text = st.checkbox("Show extracted text", value=False)
+
+        st.divider()
+        if st.button("Logout", use_container_width=True):
+            st.session_state["user"] = None
+            reset_current_document()
+            st.rerun()
+
+    tab_upload, tab_history = st.tabs(["Analyze Documents", "Saved Analyses"])
+
+    with tab_upload:
+        uploaded_files = st.file_uploader(
+            "Upload one or more PDF files",
+            type="pdf",
+            accept_multiple_files=True
+        )
+
+        if uploaded_files:
+            file_names = [f.name for f in uploaded_files]
+            selected_file_name = st.selectbox("Choose a file to analyze", file_names)
+
+            selected_file = None
+            for f in uploaded_files:
+                if f.name == selected_file_name:
+                    selected_file = f
+                    break
+
+            col_a, col_b = st.columns([3, 1])
+            with col_a:
+                analyze_button = st.button("Analyze Selected Document", use_container_width=True)
+            with col_b:
+                if st.button("Clear Current Analysis", use_container_width=True):
+                    reset_current_document()
+                    st.rerun()
+
+            if analyze_button and selected_file is not None:
+                with st.spinner("Reading and analyzing the document..."):
+                    text, num_pages = extract_text_from_pdf(selected_file)
+
+                    if not text.strip():
+                        st.error("No readable text was found in the PDF.")
+                    else:
+                        lang = detect_language(text)
+                        keywords = extract_keywords(text, lang, top_n=8)
+                        model_used = "Local"
+
+                        if mode == "OpenAI":
+                            summary, _ = ai_summarize_with_openai(text, lang, num_sentences)
+                            explanation, _ = ai_explain_document(text, lang)
+                            questions, _ = ai_generate_questions(text, lang, num_questions)
+                            key_points, _ = ai_key_points(text, lang, num_points)
+
+                            if summary and explanation and questions and key_points:
+                                model_used = "OpenAI"
+                            else:
+                                st.warning("OpenAI is unavailable right now, so Smart Local was used instead.")
+                                summary = local_summarize(text, lang, num_sentences)
+                                explanation = local_explain_document(text, lang)
+                                questions = local_generate_questions(text, lang, num_questions)
+                                key_points = local_key_points(text, lang, num_points)
+                                model_used = "Local fallback"
+                        else:
+                            summary = local_summarize(text, lang, num_sentences)
+                            explanation = local_explain_document(text, lang)
+                            questions = local_generate_questions(text, lang, num_questions)
+                            key_points = local_key_points(text, lang, num_points)
+
+                        st.session_state["current_text"] = text
+                        st.session_state["current_lang"] = lang
+                        st.session_state["current_name"] = selected_file.name
+                        st.session_state["current_summary"] = summary
+                        st.session_state["current_explanation"] = explanation
+                        st.session_state["current_questions"] = questions
+                        st.session_state["current_key_points"] = key_points
+                        st.session_state["current_keywords"] = keywords
+                        st.session_state["current_mode"] = model_used
+                        st.session_state["current_pages"] = num_pages
+                        st.session_state["current_characters"] = len(text)
+
+                        save_analysis(
+                            user_id=user["id"],
+                            document_name=selected_file.name,
+                            language=lang,
+                            mode_used=model_used,
+                            pages_count=num_pages,
+                            characters_count=len(text),
+                            keywords=", ".join(keywords),
+                            summary=summary,
+                            explanation=explanation,
+                            key_points=key_points,
+                            questions=questions,
+                            extracted_text=text
+                        )
+
+                        st.success("Analysis completed and saved to database.")
+
+        if "current_text" in st.session_state:
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-number">{st.session_state["current_pages"]}</div>
+                    <div class="metric-label">Pages</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with col2:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-number">{st.session_state["current_characters"]}</div>
+                    <div class="metric-label">Characters</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with col3:
+                language_name = "Arabic" if st.session_state["current_lang"] == "ar" else "English"
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-number">{language_name}</div>
+                    <div class="metric-label">{st.session_state["current_mode"]}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            st.subheader("Document")
+            st.write(st.session_state["current_name"])
+
+            st.subheader("Keywords")
+            render_keywords(st.session_state["current_keywords"])
+
+            st.subheader("Summary")
+            st.markdown(
+                f'<div class="output-box">{st.session_state["current_summary"].replace(chr(10), "<br><br>")}</div>',
+                unsafe_allow_html=True
+            )
+
+            st.subheader("Explain Document")
+            st.markdown(
+                f'<div class="output-box">{st.session_state["current_explanation"].replace(chr(10), "<br><br>")}</div>',
+                unsafe_allow_html=True
+            )
+
+            st.subheader("Key Points")
+            st.markdown(
+                f'<div class="output-box">{st.session_state["current_key_points"].replace(chr(10), "<br>")}</div>',
+                unsafe_allow_html=True
+            )
+
+            st.subheader("Generated Questions")
+            st.markdown(
+                f'<div class="output-box">{st.session_state["current_questions"].replace(chr(10), "<br>")}</div>',
+                unsafe_allow_html=True
+            )
+
+            download_text = f"""DOCUMENT
+{st.session_state["current_name"]}
+
+SUMMARY
+{st.session_state["current_summary"]}
+
+EXPLANATION
+{st.session_state["current_explanation"]}
+
+KEY POINTS
+{st.session_state["current_key_points"]}
+
+QUESTIONS
+{st.session_state["current_questions"]}
+"""
+            st.download_button(
+                label="Download Analysis",
+                data=download_text,
+                file_name="document_analysis.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+
+            if show_text:
+                with st.expander("Show extracted text"):
+                    st.write(st.session_state["current_text"][:8000])
+
+    with tab_history:
+        st.subheader("Saved Analyses")
+        analyses = get_user_analyses(user["id"])
+
+        if not analyses:
+            st.info("No saved analyses yet.")
+        else:
+            selected_history_id = None
+            options = {}
+            for row in analyses:
+                label = f'#{row["id"]} - {row["document_name"]} - {row["created_at"][:19]}'
+                options[label] = row["id"]
+
+            chosen_label = st.selectbox("Choose a saved analysis", list(options.keys()))
+            selected_history_id = options[chosen_label]
+
+            selected_row = None
+            for row in analyses:
+                if row["id"] == selected_history_id:
+                    selected_row = row
+                    break
+
+            if selected_row:
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-number">{num_pages}</div>
+                        <div class="metric-number">{selected_row["pages_count"]}</div>
                         <div class="metric-label">Pages</div>
                     </div>
                     """, unsafe_allow_html=True)
                 with col2:
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-number">{len(text)}</div>
+                        <div class="metric-number">{selected_row["characters_count"]}</div>
                         <div class="metric-label">Characters</div>
                     </div>
                     """, unsafe_allow_html=True)
                 with col3:
-                    language_name = "Arabic" if lang == "ar" else "English"
+                    lang_name = "Arabic" if selected_row["language"] == "ar" else "English"
                     st.markdown(f"""
                     <div class="metric-card">
-                        <div class="metric-number">{language_name}</div>
-                        <div class="metric-label">{model_used}</div>
+                        <div class="metric-number">{lang_name}</div>
+                        <div class="metric-label">{selected_row["mode_used"]}</div>
                     </div>
                     """, unsafe_allow_html=True)
 
+                st.write(f'**Document:** {selected_row["document_name"]}')
+                st.write(f'**Created at:** {selected_row["created_at"][:19]}')
+
+                keywords = [k.strip() for k in selected_row["keywords"].split(",") if k.strip()]
                 st.subheader("Keywords")
                 render_keywords(keywords)
 
                 st.subheader("Summary")
-                st.markdown(f'<div class="output-box">{summary.replace(chr(10), "<br><br>")}</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="output-box">{selected_row["summary"].replace(chr(10), "<br><br>")}</div>',
+                    unsafe_allow_html=True
+                )
 
-                st.subheader("Explain Document")
-                st.markdown(f'<div class="output-box">{explanation.replace(chr(10), "<br><br>")}</div>', unsafe_allow_html=True)
+                st.subheader("Explanation")
+                st.markdown(
+                    f'<div class="output-box">{selected_row["explanation"].replace(chr(10), "<br><br>")}</div>',
+                    unsafe_allow_html=True
+                )
 
                 st.subheader("Key Points")
-                st.markdown(f'<div class="output-box">{key_points.replace(chr(10), "<br>")}</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="output-box">{selected_row["key_points"].replace(chr(10), "<br>")}</div>',
+                    unsafe_allow_html=True
+                )
 
-                st.subheader("Generated Questions")
-                st.markdown(f'<div class="output-box">{questions.replace(chr(10), "<br>")}</div>', unsafe_allow_html=True)
+                st.subheader("Questions")
+                st.markdown(
+                    f'<div class="output-box">{selected_row["questions"].replace(chr(10), "<br>")}</div>',
+                    unsafe_allow_html=True
+                )
 
-                download_text = f"""SUMMARY
+                history_download = f"""DOCUMENT
+{selected_row["document_name"]}
 
-{summary}
+SUMMARY
+{selected_row["summary"]}
 
 EXPLANATION
-
-{explanation}
+{selected_row["explanation"]}
 
 KEY POINTS
-
-{key_points}
+{selected_row["key_points"]}
 
 QUESTIONS
-
-{questions}
+{selected_row["questions"]}
 """
-
                 st.download_button(
-                    label="Download Analysis",
-                    data=download_text,
-                    file_name="document_analysis.txt",
+                    label="Download This Saved Analysis",
+                    data=history_download,
+                    file_name=f'analysis_{selected_row["id"]}.txt',
                     mime="text/plain",
                     use_container_width=True
                 )
-
-                if show_text:
-                    with st.expander("Show extracted text"):
-                        st.write(text[:8000])
-
-if "doc_text" in st.session_state:
-    st.subheader("Chat with Document")
-
-    if st.session_state.get("doc_name"):
-        st.caption(f"Current document: {st.session_state['doc_name']}")
-
-    user_question = st.text_input("Ask a question about the document")
-
-    if st.button("Ask Question", use_container_width=True):
-        if not user_question.strip():
-            st.warning("Please enter a question first.")
-        else:
-            text = st.session_state["doc_text"]
-            lang = st.session_state["doc_lang"]
-            mode = st.session_state.get("analysis_mode", "Smart Local")
-
-            with st.spinner("Searching for the answer..."):
-                answer = None
-
-                if mode == "OpenAI":
-                    answer, error_message = ai_answer_question(text, user_question, lang)
-                    if not answer:
-                        st.warning("OpenAI is unavailable right now, so Smart Local was used instead.")
-                        if error_message:
-                            st.caption(f"Reason: {error_message}")
-                        answer = local_answer_question(text, user_question, lang)
-                else:
-                    answer = local_answer_question(text, user_question, lang)
-
-            st.markdown("### Answer")
-            st.markdown(f'<div class="output-box">{answer.replace(chr(10), "<br><br>")}</div>', unsafe_allow_html=True)
-
-else:
-    st.info("ابدأ برفع ملف PDF لتجربة التطبيق.")
