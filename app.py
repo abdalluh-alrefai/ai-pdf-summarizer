@@ -132,10 +132,7 @@ def local_summarize(text: str, lang: str, num_sentences: int = 5):
 
 def local_key_points(text: str, lang: str, num_points: int = 5):
     summary = local_summarize(text, lang, num_sentences=num_points)
-    if lang == "ar":
-        points = [f"- {s.strip()}" for s in summary.split("\n\n") if s.strip()]
-    else:
-        points = [f"- {s.strip()}" for s in summary.split("\n\n") if s.strip()]
+    points = [f"- {s.strip()}" for s in summary.split("\n\n") if s.strip()]
     return "\n".join(points)
 
 
@@ -162,6 +159,35 @@ def local_generate_questions(text: str, lang: str, num_questions: int = 5):
         return "لا توجد أسئلة قابلة للتوليد." if lang == "ar" else "No questions could be generated."
 
     return "\n".join(questions)
+
+
+def local_answer_question(text: str, question: str, lang: str):
+    sentences = split_sentences(text, lang)
+    if not sentences:
+        return "لا يوجد نص للإجابة منه." if lang == "ar" else "There is no text to answer from."
+
+    if lang == "ar":
+        q_words = set(re.findall(r'[\u0600-\u06FF]+', question))
+        scored = []
+        for sentence in sentences:
+            s_words = set(re.findall(r'[\u0600-\u06FF]+', sentence))
+            score = len(q_words.intersection(s_words))
+            scored.append((score, sentence))
+    else:
+        q_words = set(re.findall(r'[A-Za-z]+', question.lower()))
+        scored = []
+        for sentence in sentences:
+            s_words = set(re.findall(r'[A-Za-z]+', sentence.lower()))
+            score = len(q_words.intersection(s_words))
+            scored.append((score, sentence))
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+    best_sentences = [sentence for score, sentence in scored[:3] if score > 0]
+
+    if best_sentences:
+        return "\n\n".join(best_sentences)
+
+    return "لم أجد إجابة واضحة في المستند." if lang == "ar" else "I could not find a clear answer in the document."
 
 
 def ai_text_task(prompt_system: str, prompt_user: str):
@@ -265,6 +291,32 @@ Text:
     return ai_text_task(system_prompt, user_prompt)
 
 
+def ai_answer_question(text: str, question: str, lang: str):
+    if lang == "ar":
+        system_prompt = "أنت مساعد يجيب على الأسئلة اعتمادًا على محتوى المستند فقط."
+        user_prompt = f"""أجب على السؤال التالي اعتمادًا على النص فقط.
+إذا لم تكن الإجابة موجودة بوضوح في النص، قل: لا أجد إجابة واضحة في المستند.
+
+السؤال:
+{question}
+
+النص:
+{text[:12000]}
+"""
+    else:
+        system_prompt = "You answer questions using only the document content."
+        user_prompt = f"""Answer the following question using only the text below.
+If the answer is not clearly in the text, say: I could not find a clear answer in the document.
+
+Question:
+{question}
+
+Text:
+{text[:12000]}
+"""
+    return ai_text_task(system_prompt, user_prompt)
+
+
 def render_keywords(keywords):
     if not keywords:
         return
@@ -343,7 +395,7 @@ st.markdown("""
 <div class="hero-box">
     <div class="hero-title">AI Document Analyzer</div>
     <div class="hero-subtitle">
-        ارفع ملف PDF لتحصل على ملخص، كلمات مفتاحية، شرح مبسط، أسئلة، وأهم النقاط.
+        ارفع ملف PDF لتحصل على ملخص، كلمات مفتاحية، شرح مبسط، أسئلة، أهم النقاط، ودردشة مع المستند.
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -376,13 +428,17 @@ if uploaded_file is not None:
                 lang = detect_language(text)
                 keywords = extract_keywords(text, lang, top_n=8)
 
+                st.session_state["doc_text"] = text
+                st.session_state["doc_lang"] = lang
+                st.session_state["doc_name"] = uploaded_file.name
+
                 model_used = "Local"
 
                 if mode == "OpenAI":
-                    summary, summary_err = ai_summarize_with_openai(text, lang, num_sentences)
-                    explanation, explain_err = ai_explain_document(text, lang)
-                    questions, questions_err = ai_generate_questions(text, lang, num_questions)
-                    key_points, points_err = ai_key_points(text, lang, num_points)
+                    summary, _ = ai_summarize_with_openai(text, lang, num_sentences)
+                    explanation, _ = ai_explain_document(text, lang)
+                    questions, _ = ai_generate_questions(text, lang, num_questions)
+                    key_points, _ = ai_key_points(text, lang, num_points)
 
                     if summary and explanation and questions and key_points:
                         model_used = "OpenAI"
@@ -398,6 +454,8 @@ if uploaded_file is not None:
                     explanation = local_explain_document(text, lang)
                     questions = local_generate_questions(text, lang, num_questions)
                     key_points = local_key_points(text, lang, num_points)
+
+                st.session_state["analysis_mode"] = mode
 
                 col1, col2, col3 = st.columns(3)
                 with col1:
@@ -466,5 +524,38 @@ QUESTIONS
                 if show_text:
                     with st.expander("Show extracted text"):
                         st.write(text[:8000])
+
+if "doc_text" in st.session_state:
+    st.subheader("Chat with Document")
+
+    if st.session_state.get("doc_name"):
+        st.caption(f"Current document: {st.session_state['doc_name']}")
+
+    user_question = st.text_input("Ask a question about the document")
+
+    if st.button("Ask Question", use_container_width=True):
+        if not user_question.strip():
+            st.warning("Please enter a question first.")
+        else:
+            text = st.session_state["doc_text"]
+            lang = st.session_state["doc_lang"]
+            mode = st.session_state.get("analysis_mode", "Smart Local")
+
+            with st.spinner("Searching for the answer..."):
+                answer = None
+
+                if mode == "OpenAI":
+                    answer, error_message = ai_answer_question(text, user_question, lang)
+                    if not answer:
+                        st.warning("OpenAI is unavailable right now, so Smart Local was used instead.")
+                        if error_message:
+                            st.caption(f"Reason: {error_message}")
+                        answer = local_answer_question(text, user_question, lang)
+                else:
+                    answer = local_answer_question(text, user_question, lang)
+
+            st.markdown("### Answer")
+            st.markdown(f'<div class="output-box">{answer.replace(chr(10), "<br><br>")}</div>', unsafe_allow_html=True)
+
 else:
     st.info("ابدأ برفع ملف PDF لتجربة التطبيق.")
